@@ -21,6 +21,7 @@ package wsclient
 import (
     "bufio"
 	"crypto/tls"
+    "encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -118,68 +119,6 @@ type ClientServerImpl struct {
 	TypeDecoder
 }
 
-func (cs *ClientServerImpl) ConnectWithProxyIfNeeded(parsedURL *url.URL, request *http.Request) (*tls.Conn, error) {
-	proxyURL, err := http.ProxyFromEnvironment(request)
-	if err != nil {
-		return nil, err
-	}
-
-    // url.Host might not have the port, but tls.Dial needs it
-    targetHost := parsedURL.Host
-    if !strings.Contains(targetHost, ":") {
-        targetHost += ":443"
-    }
-    targetHostname, _ , err := net.SplitHostPort(targetHost)
-    if err != nil {
-        return nil, err
-    }
-
-    tlsConfig := tls.Config{ServerName: targetHostname, InsecureSkipVerify: cs.AcceptInvalidCert}
-    timeoutDialer := &net.Dialer{Timeout: wsConnectTimeout}
-
-	if proxyURL == nil {
-        // directly connect
-		log.Info("Creating poll dialer", "host", parsedURL.Host)
-		return tls.DialWithDialer(timeoutDialer, "tcp", targetHost, &tlsConfig)
-	} else {
-        // connect via proxy
-		log.Info("Creating poll dialer", "proxy", proxyURL.Host, "host", parsedURL.Host)
-        plainConn, err := timeoutDialer.Dial("tcp", proxyURL.Host)
-        if err != nil {
-            return nil, err
-        }
-
-        // TLS over an HTTP proxy via CONNECT taken from: https://golang.org/src/net/http/transport.go
-        connectReq := &http.Request{
-            Method: "CONNECT",
-            URL: &url.URL{Opaque: targetHost},
-            Host: targetHost,
-            Header: make(http.Header),
-        }
-
-        connectReq.Write(plainConn)
-
-        // Read response.
-        // Okay to use and discard buffered reader here, because
-        // TLS server will not speak until spoken to.
-        br := bufio.NewReader(plainConn)
-        resp, err := http.ReadResponse(br, connectReq)
-        if err != nil {
-            plainConn.Close()
-            return nil, err
-        }
-        if resp.StatusCode != 200 {
-            f := strings.SplitN(resp.Status, " ", 2)
-            plainConn.Close()
-            return nil, errors.New(f[1])
-        }
-
-        tlsConn := tls.Client(plainConn, &tlsConfig)
-
-        return tlsConn, nil
-    }
-}
-
 // Connect opens a connection to the backend and upgrades it to a websocket. Calls to
 // 'MakeRequest' can be made after calling this, but responss will not be
 // receivable until 'Serve' is also called.
@@ -195,7 +134,7 @@ func (cs *ClientServerImpl) Connect() error {
 	// Sign the request; we'll send its headers via the websocket client which includes the signature
 	utils.SignHTTPRequest(request, cs.Region, ServiceName, cs.CredentialProvider, nil)
 
-	wsConn, err := cs.ConnectWithProxyIfNeeded(parsedURL, request)
+	wsConn, err := cs.connectWithProxyIfNeeded(parsedURL, request)
 	if err != nil {
 		return err
 	}
@@ -339,4 +278,73 @@ func (cs *ClientServerImpl) handleMessage(data []byte) {
 	} else {
 		log.Info("No handler for message type", "type", typeStr)
 	}
+}
+
+func (cs *ClientServerImpl) connectWithProxyIfNeeded(parsedURL *url.URL, request *http.Request) (*tls.Conn, error) {
+	proxyURL, err := http.ProxyFromEnvironment(request)
+	if err != nil {
+		return nil, err
+	}
+
+    // url.Host might not have the port, but tls.Dial needs it
+    targetHost := parsedURL.Host
+    if !strings.Contains(targetHost, ":") {
+        targetHost += ":443"
+    }
+    targetHostname, _ , err := net.SplitHostPort(targetHost)
+    if err != nil {
+        return nil, err
+    }
+
+    tlsConfig := tls.Config{ServerName: targetHostname, InsecureSkipVerify: cs.AcceptInvalidCert}
+    timeoutDialer := &net.Dialer{Timeout: wsConnectTimeout}
+
+	if proxyURL == nil {
+        // directly connect
+		log.Info("Creating poll dialer", "host", parsedURL.Host)
+		return tls.DialWithDialer(timeoutDialer, "tcp", targetHost, &tlsConfig)
+	} else {
+        // connect via proxy
+		log.Info("Creating poll dialer", "proxy", proxyURL.Host, "host", parsedURL.Host)
+        plainConn, err := timeoutDialer.Dial("tcp", proxyURL.Host)
+        if err != nil {
+            return nil, err
+        }
+
+        // TLS over an HTTP proxy via CONNECT taken from: https://golang.org/src/net/http/transport.go
+        connectReq := &http.Request{
+            Method: "CONNECT",
+            URL: &url.URL{Opaque: targetHost},
+            Host: targetHost,
+            Header: make(http.Header),
+        }
+
+        if proxyUser := proxyURL.User; proxyUser != nil {
+            username := proxyUser.Username()
+            password, _ := proxyUser.Password()
+            auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+            connectReq.Header.Set("Proxy-Authorization", "Basic " + auth)
+        }
+
+        connectReq.Write(plainConn)
+
+        // Read response.
+        // Okay to use and discard buffered reader here, because
+        // TLS server will not speak until spoken to.
+        br := bufio.NewReader(plainConn)
+        resp, err := http.ReadResponse(br, connectReq)
+        if err != nil {
+            plainConn.Close()
+            return nil, err
+        }
+        if resp.StatusCode != 200 {
+            f := strings.SplitN(resp.Status, " ", 2)
+            plainConn.Close()
+            return nil, errors.New(f[1])
+        }
+
+        tlsConn := tls.Client(plainConn, &tlsConfig)
+
+        return tlsConn, nil
+    }
 }
